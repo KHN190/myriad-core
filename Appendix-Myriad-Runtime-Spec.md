@@ -42,7 +42,7 @@ Across `call` / `call_reg` / `ret` and native dispatch, the destination register
 `call r_a, fn_id` and `call_reg r_a, r_b`:
 
 1. Resolve the target. If it's a **native** chunk (§8), see below.
-2. Otherwise begin a new call. The caller stages args at registers `r(caller_reg_count − param_count)..r(caller_reg_count − 1)` of its own window — i.e., the last `param_count` registers of the caller's declared register count. The callee reads them as `r0..r(param_count-1)`. Execution starts at the callee's first instruction. The destination register `r_a` is remembered so `ret` knows where to deliver the result.
+2. Otherwise begin a new call. The caller stages args at registers `r(caller_reg_count)..r(caller_reg_count + param_count - 1)` — the `param_count` register slots **immediately past** the caller's declared register count. The callee reads them as `r0..r(param_count-1)` (the callee's window starts at exactly that address). Execution starts at the callee's first instruction. The destination register `r_a` is remembered so `ret` knows where to deliver the result.
 
 `ret r_a`:
 
@@ -122,7 +122,9 @@ The arm receives no explicit continuation handle. The continuation it can `resum
 
 A handler may set a return arm (`DEO 0xE003` for `fn_id`, `DEO 0xE004` for env) at any point during its lifetime. Each write overwrites the prior pending value. Both `fn_id` and env default to "unset" when a handler is pushed.
 
-The return arm fires **on the body's ret** — i.e., on value `V` (body's natural return), not on `W` (arm's final ret in the resume path). With a return arm set, body's ret value `V` is **rerouted** through the return arm before continuing along whatever path `V` was about to take (to `arm.r_a` in the resume path, or to the handle expression's caller in the no-resume path). The return arm sees:
+The return arm fires **on the body's ret** — both in the no-resume and resume paths. Body's `V` is rerouted through the return arm; the return arm's `V'` replaces `V` (`V'` flows to the handle's caller in the no-resume path, to `resume.r_a` in the resume path). The arm's own subsequent ret (`W` in the resume path) does **not** pass through the return arm.
+
+The return arm sees:
 
 ```
 r0 = pending_return_arm_env
@@ -130,7 +132,7 @@ r1 = 0
 r2 = V (body's return value, tag preserved)
 ```
 
-Its own ret value `V'` replaces `V` in the downstream flow. The return arm must emit `DEO 0xE001` to pop the handler before it returns.
+The return arm must emit `DEO 0xE001` to pop the handler before its own `ret`.
 
 **The handler is never auto-popped**. The cart is responsible for emitting `DEO 0xE001` on every exit path:
 

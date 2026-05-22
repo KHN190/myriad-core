@@ -707,28 +707,6 @@ static void do_ret(VM* vm, uint64_t v, uint8_t v_is_handle) {
 
     for (uint32_t i = vm->hsp; i-- > 0;) {
         Handler* h = &vm->handlers[i];
-        if (h->body_sp == vm->sp && h->arm_cont) {
-            ArmSnap* as = h->arm_cont;
-            h->arm_cont = as->prev;
-            if (h->pending_arm_env_is_handle) vm_drop_handle(vm, h->pending_arm_env);
-            h->pending_arm_fn = DISPATCH_MISS;
-            h->pending_arm_env = 0;
-            h->pending_arm_env_is_handle = 0;
-            fr->fn_id = as->fn_id;
-            fr->ip    = as->ip;
-            fr->base  = as->base;
-            fr->mask  = as->mask;
-            memcpy(&vm->regs[as->base], as->regs, sizeof(uint64_t) * REGS_PER_FRAME);
-            vm->regs[as->base + as->ra] = v;
-            if (v_is_handle) fr->mask |= (1ULL << as->ra);
-            else             fr->mask &= ~(1ULL << as->ra);
-            free(as);
-            return;
-        }
-    }
-
-    for (uint32_t i = vm->hsp; i-- > 0;) {
-        Handler* h = &vm->handlers[i];
         if (h->body_sp == vm->sp && h->pending_arm_fn != DISPATCH_MISS) {
             uint16_t arm_fn = h->pending_arm_fn;
             uint64_t env = h->pending_arm_env;
@@ -747,6 +725,24 @@ static void do_ret(VM* vm, uint64_t v, uint8_t v_is_handle) {
             vm->regs[fr->base + 1] = 0;
             vm->regs[fr->base + 2] = v;
             if (v_is_handle) fr->mask |= 1ULL << 2;
+            return;
+        }
+    }
+
+    for (uint32_t i = vm->hsp; i-- > 0;) {
+        Handler* h = &vm->handlers[i];
+        if (h->body_sp == vm->sp && h->arm_cont) {
+            ArmSnap* as = h->arm_cont;
+            h->arm_cont = as->prev;
+            fr->fn_id = as->fn_id;
+            fr->ip    = as->ip;
+            fr->base  = as->base;
+            fr->mask  = as->mask;
+            memcpy(&vm->regs[as->base], as->regs, sizeof(uint64_t) * REGS_PER_FRAME);
+            vm->regs[as->base + as->ra] = v;
+            if (v_is_handle) fr->mask |= (1ULL << as->ra);
+            else             fr->mask &= ~(1ULL << as->ra);
+            free(as);
             return;
         }
     }
