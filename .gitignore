@@ -1,0 +1,5 @@
+myriad
+*.o
+*.dSYM
+.DS_Store
+*.pk
