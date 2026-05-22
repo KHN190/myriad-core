@@ -17,7 +17,7 @@ PAYLOADS       per function, in table order
 | offset | size | field         | value                                 |
 |--------|------|---------------|---------------------------------------|
 | 0      | 4    | magic         | `0xECFF00EC`                          |
-| 4      | 2    | version       | `0x0100`                              |
+| 4      | 2    | version       | `0x0200`                              |
 | 6      | 2    | flags         | reserved, zero                        |
 | 8      | 4    | entry_fn_id   | index into the function table         |
 
