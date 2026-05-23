@@ -168,10 +168,14 @@ Port encoding: `(device_id << 8) | port_id`. `DEI` / `DEO` against an absent dev
 
 | Port | Dir | Semantics |
 |---|---|---|
-| `0x00` | in | Spec version, packed as `(major << 48) \| (minor << 32) \| patch`, with `major:16`, `minor:16`, `patch:32`. |
+| `0x00` | in | Spec version major (u16 in low 16). |
 | `0x01` | out | Halt. Low 32 bits = exit code. |
 | `0x02` | out | Panic. Operand is a string handle (§7); host prints to stderr and halts with code 1. |
 | `0x03` | in | Module load flags (host-defined; zero on a bare host). |
+| `0x04` | in | Spec version minor (u16 in low 16). |
+| `0x05` | in | Spec version patch (u32 in low 32). |
+
+Split fields fit a 32-bit Value cart (`INT32_SAFE`); the previous 64-bit packing was unreadable on 32-bit carts.
 
 ### 6.2 Console (`0x10`)
 

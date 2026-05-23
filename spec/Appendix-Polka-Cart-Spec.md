@@ -17,11 +17,13 @@ PAYLOADS       per function, in table order
 | offset | size | field         | value                                 |
 |--------|------|---------------|---------------------------------------|
 | 0      | 4    | magic         | `0xECFF00EC`                          |
-| 4      | 2    | version       | `0x0200`                              |
-| 6      | 2    | flags         | reserved, zero                        |
+| 4      | 2    | version       | `0x0201`                              |
+| 6      | 2    | flags         | bit 0 = `INT32_SAFE`; others reserved zero |
 | 8      | 4    | entry_fn_id   | index into the function table         |
 
-A loader rejects a cart with the wrong magic or an unsupported version.
+A loader rejects a cart with the wrong magic or an unsupported version. 
+
+`INT32_SAFE` binds value encoding: Int constants are i32 sign-extended in the low 32 bits, Float constants are **f32 bit patterns** in the low 32 bits (high 32 = 0), arithmetic stays in i32 / f32. A runtime loading such a cart must narrow float ops to f32 — it cannot read constants as f64.
 
 ## Function Table
 

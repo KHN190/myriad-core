@@ -1,3 +1,28 @@
+/*
+ * Myriad runtime, 32-bit profile.
+ *
+ * Same Polka cartridge format as the 64-bit runtime (main.c); the only
+ * cart-side difference is the INT32_SAFE flag (Polka header bit 0). When set,
+ * every Int constant / arithmetic result fits in i32 and every Float is exactly
+ * representable as f32. This runtime takes the spec up on the "use 32-bit
+ * storage" option:
+ *
+ *   - registers, cell slots, constants, and call args/returns are 32-bit;
+ *   - integer ops wrap mod 2^32, comparisons/div/mod/neg are signed i32;
+ *   - float ops are IEEE-754 f32;
+ *   - handles are byte offsets into a single fixed heap arena, not host
+ *     pointers (a 64-bit pointer cannot live in a 32-bit register);
+ *   - the whole VM footprint (register file + call stack + handler/region
+ *     stacks + heap arena) is bounded to TOTAL_RAM (4 MB).
+ *
+ * Because storage is 32-bit, this runtime requires INT32_SAFE; a cart without
+ * it could carry values that don't fit and is rejected at load time.
+ *
+ * Constant note: INT32_SAFE constants are read as the low 32 bits of each u64
+ * cart slot. The compiler is expected to emit i32 values and f32 bit patterns
+ * zero-extended into those slots.
+ */
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -5,27 +30,50 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAGIC          0xECFF00ECu
-#define VERSION        0x0201
-#define SPEC_MAJOR     0u   /* reported via System 0x00 / 0x04 / 0x05 */
-#define SPEC_MINOR     1u
-#define SPEC_PATCH     0u
-#define REGS_PER_FRAME 64
-#define MAX_FRAMES     16384
-#define MAX_REGS       (REGS_PER_FRAME * MAX_FRAMES)
-#define MAX_HANDLERS   256
-#define MAX_REGIONS    256
-#define DISPATCH_MISS  0xFFFFu
-#define HANDLE_NONE    UINT64_MAX
+#define MAGIC           0xECFF00ECu
+#define VERSION         0x0201
+#define FLAG_INT32_SAFE 0x0001u
+#define SPEC_MAJOR      0u   /* reported via System 0x00 / 0x04 / 0x05 */
+#define SPEC_MINOR      1u
+#define SPEC_PATCH      0u
+#define REGS_PER_FRAME  64
+#define TOTAL_RAM       (4u * 1024 * 1024)  /* whole-VM ceiling */
+#define MAX_FRAMES      512                 /* regs[] = 64*512*4 = 128 KB */
+#define MAX_REGS        (REGS_PER_FRAME * MAX_FRAMES)
+#define MAX_HANDLERS    64
+#define MAX_REGIONS     64
+#define DISPATCH_MISS   0xFFFFu
+#define HANDLE_NONE     0xFFFFFFFFu         /* null handle in 32-bit storage */
 
+/* A register/slot/constant value: untagged 32 bits. */
+typedef uint32_t Val;
+
+/*
+ * Heap arena. A fixed byte buffer carved into blocks by a first-fit free-list
+ * allocator. Each block has an 8-byte header; the payload follows. A Cell
+ * handle is the byte offset of the Cell (the block payload) within the arena.
+ * Offset 0 is always a block header, never a payload, so handle 0 and
+ * HANDLE_NONE are both safe null sentinels.
+ */
+#define BLK_FREE 0u
+#define BLK_CELL 1u   /* payload is a Cell; participates in region scan */
+#define BLK_RAW  2u   /* payload is runtime bookkeeping (ContCell/ArmSnap) */
+
+typedef struct {
+    uint32_t size;   /* total bytes including this header, multiple of 4 */
+    uint32_t kind;   /* BLK_* */
+} BlkHdr;
+
+/*
+ * Cell header. Tag words and slots follow inline (no separate allocations):
+ *   [Cell][ceil(size/32) u32 tag words][size u32 slots]
+ * Each slot carries a value/handle tag bit, observable through opcodes.
+ */
 typedef struct Cell {
     uint32_t rc;
-    uint32_t size;
+    uint32_t size;       /* slot count */
     uint32_t gen;
     uint32_t region_id;
-    uint64_t tags[2];
-    uint64_t* tags_ext;
-    uint64_t slots[];
 } Cell;
 
 typedef struct {
@@ -36,7 +84,7 @@ typedef struct {
     uint16_t  string_count;
     uint32_t  code_count;
     uint16_t  name_len;
-    uint64_t* constants;
+    uint64_t* constants;     /* raw cart constants (u64); loaded as low-32 */
     uint8_t*  const_mask;
     uint8_t*  code;
     char*     name;
@@ -56,11 +104,11 @@ typedef struct {
     uint32_t ip;
     uint32_t base;
     uint8_t  dest;
-    uint64_t mask;
+    uint64_t mask;       /* one handle/value bit per register in the window */
 } Frame;
 
 typedef struct ContCell {
-    uint64_t regs[REGS_PER_FRAME];
+    Val      regs[REGS_PER_FRAME];
     uint64_t mask;
     uint32_t body_sp;
     uint8_t  consumed;
@@ -74,34 +122,33 @@ typedef struct ArmSnap {
     uint8_t  dest;
     uint64_t mask;
     uint32_t sp;
-    uint64_t regs[REGS_PER_FRAME];
+    Val      regs[REGS_PER_FRAME];
     uint8_t  ra;
     struct ArmSnap* prev;
 } ArmSnap;
 
 typedef struct {
     uint16_t  effect_id;
-    uint64_t  dispatch;
+    Val       dispatch;            /* dispatch-table handle */
     uint8_t   dispatch_is_handle;
     uint32_t  install_sp;
     uint32_t  body_sp;
     uint16_t  pending_arm_fn;
-    uint64_t  pending_arm_env;
+    Val       pending_arm_env;
     uint8_t   pending_arm_env_is_handle;
-    ContCell* last_cont;
+    ContCell* last_cont;           /* host ptr into the (immovable) arena */
     ArmSnap*  arm_cont;
 } Handler;
 
 typedef struct {
-    uint32_t id;
-    Cell**   cells;
-    uint32_t count;
-    uint32_t cap;
+    uint32_t id;                   /* membership tracked via Cell.region_id */
 } Region;
 
 typedef struct {
     Cart*    cart;
-    uint64_t regs[MAX_REGS];
+    uint8_t* arena;
+    uint32_t arena_size;
+    Val      regs[MAX_REGS];
     Frame    stack[MAX_FRAMES];
     uint32_t sp;
     Handler  handlers[MAX_HANDLERS];
@@ -127,100 +174,146 @@ static uint64_t rd_u64(const uint8_t* p) {
     return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
 }
 
-static double u_to_d(uint64_t u) { union { uint64_t u; double d; } v; v.u = u; return v.d; }
-static uint64_t d_to_u(double d) { union { uint64_t u; double d; } v; v.d = d; return v.u; }
+/* f32 bit reinterpretation (was f64 in the 64-bit runtime). */
+static float    u_to_f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
+static uint32_t f_to_u(float f)    { union { uint32_t u; float f; } v; v.f = f; return v.u; }
 
-static uint64_t* cell_tags_ptr(Cell* c) {
-    return c->size > 128 ? c->tags_ext : c->tags;
+/* ---- Arena allocator ---------------------------------------------------- */
+
+static void arena_init(VM* vm) {
+    vm->arena_size &= ~7u;                  /* keep blocks 4-aligned, sizes even */
+    if (vm->arena_size < sizeof(BlkHdr) + 4) die("arena too small");
+    BlkHdr* h = (BlkHdr*)vm->arena;
+    h->size = vm->arena_size;
+    h->kind = BLK_FREE;
 }
+
+/* Allocate a zeroed payload of >= nbytes; returns NULL when the arena is full. */
+static void* arena_alloc(VM* vm, uint32_t nbytes, uint32_t kind) {
+    uint32_t need = (uint32_t)sizeof(BlkHdr) + ((nbytes + 3u) & ~3u);
+    if (need < sizeof(BlkHdr) + 4) need = sizeof(BlkHdr) + 4;
+
+    uint32_t off = 0;
+    while (off < vm->arena_size) {
+        BlkHdr* h = (BlkHdr*)(vm->arena + off);
+        if (h->size == 0) die("arena corrupt");
+        if (h->kind == BLK_FREE) {
+            /* lazily coalesce following free blocks (also covers prev-merges) */
+            uint32_t end = off + h->size;
+            while (end < vm->arena_size) {
+                BlkHdr* nh = (BlkHdr*)(vm->arena + end);
+                if (nh->kind != BLK_FREE) break;
+                h->size += nh->size;
+                end = off + h->size;
+            }
+            if (h->size >= need) {
+                uint32_t leftover = h->size - need;
+                if (leftover >= sizeof(BlkHdr) + 4) {
+                    BlkHdr* nb = (BlkHdr*)(vm->arena + off + need);
+                    nb->size = leftover;
+                    nb->kind = BLK_FREE;
+                    h->size = need;
+                }
+                h->kind = kind;
+                void* p = (uint8_t*)h + sizeof(BlkHdr);
+                memset(p, 0, h->size - sizeof(BlkHdr));
+                return p;
+            }
+        }
+        off += h->size;
+    }
+    return NULL;
+}
+
+static void arena_free(VM* vm, void* payload) {
+    if (!payload) return;
+    BlkHdr* h = (BlkHdr*)((uint8_t*)payload - sizeof(BlkHdr));
+    h->kind = BLK_FREE;
+    uint32_t off = (uint32_t)((uint8_t*)h - vm->arena);
+    uint32_t end = off + h->size;
+    if (end < vm->arena_size) {
+        BlkHdr* nh = (BlkHdr*)(vm->arena + end);
+        if (nh->kind == BLK_FREE) h->size += nh->size;
+    }
+}
+
+/* ---- Handle <-> Cell pointer -------------------------------------------- */
+
+static Cell* H2C(VM* vm, Val h) { return (Cell*)(vm->arena + h); }
+static Val   C2H(VM* vm, Cell* c) { return (Val)((uint8_t*)c - vm->arena); }
+
+static uint32_t cell_tagwords(uint32_t size) { return (size + 31) / 32; }
+static uint32_t* cell_tags(Cell* c) { return (uint32_t*)((uint8_t*)c + sizeof(Cell)); }
+static Val* cell_slots(Cell* c) { return (Val*)(cell_tags(c) + cell_tagwords(c->size)); }
 
 static int cell_tag_get(Cell* c, uint32_t i) {
-    uint64_t* t = cell_tags_ptr(c);
-    return (int)((t[i >> 6] >> (i & 63)) & 1);
+    return (int)((cell_tags(c)[i >> 5] >> (i & 31)) & 1);
 }
-
 static void cell_tag_set(Cell* c, uint32_t i, int is_handle) {
-    uint64_t* t = cell_tags_ptr(c);
-    if (is_handle) t[i >> 6] |= (1ULL << (i & 63));
-    else           t[i >> 6] &= ~(1ULL << (i & 63));
+    uint32_t* t = cell_tags(c);
+    if (is_handle) t[i >> 5] |= (1u << (i & 31));
+    else           t[i >> 5] &= ~(1u << (i & 31));
 }
 
-static void vm_drop_handle(VM* vm, uint64_t h);
+static void vm_drop_handle(VM* vm, Val h);
 
 static Cell* cell_alloc(VM* vm, uint32_t size) {
-    Cell* c = (Cell*)calloc(1, sizeof(Cell) + (size_t)size * 8);
+    uint32_t bytes = (uint32_t)sizeof(Cell) + (cell_tagwords(size) + size) * 4u;
+    Cell* c = (Cell*)arena_alloc(vm, bytes, BLK_CELL);
     if (!c) die("oom");
     c->rc = 1;
     c->size = size;
     c->gen = 1;
-    c->region_id = 0;
-    if (size > 128) {
-        uint32_t words = (size + 63) / 64;
-        c->tags_ext = (uint64_t*)calloc(words, sizeof(uint64_t));
-        if (!c->tags_ext) die("oom");
-    }
-    if (vm && vm->rsp > 0) {
-        Region* r = &vm->regions[vm->rsp - 1];
-        c->region_id = r->id;
-        if (r->count == r->cap) {
-            uint32_t nc = r->cap ? r->cap * 2 : 16;
-            r->cells = (Cell**)realloc(r->cells, nc * sizeof(Cell*));
-            if (!r->cells) die("oom");
-            r->cap = nc;
-        }
-        r->cells[r->count++] = c;
-    }
+    c->region_id = (vm->rsp > 0) ? vm->regions[vm->rsp - 1].id : 0;
     return c;
 }
 
 static void cell_free(VM* vm, Cell* c) {
+    Val* slots = cell_slots(c);
     for (uint32_t i = 0; i < c->size; i++) {
-        if (cell_tag_get(c, i)) vm_drop_handle(vm, c->slots[i]);
+        if (cell_tag_get(c, i)) vm_drop_handle(vm, slots[i]);
     }
     c->gen++;
-    free(c->tags_ext);
-    free(c);
+    arena_free(vm, c);
 }
 
-static void vm_drop_handle(VM* vm, uint64_t h) {
+static void vm_drop_handle(VM* vm, Val h) {
     if (h == HANDLE_NONE || h == 0) return;
-    Cell* c = (Cell*)(uintptr_t)h;
+    Cell* c = H2C(vm, h);
     if (c->rc == 0) return;
     if (--c->rc == 0) cell_free(vm, c);
 }
 
-static void vm_bump_handle(uint64_t h) {
+static void vm_bump_handle(VM* vm, Val h) {
     if (h == HANDLE_NONE || h == 0) return;
-    Cell* c = (Cell*)(uintptr_t)h;
-    c->rc++;
+    H2C(vm, h)->rc++;
 }
 
 static Cell* make_string_cell(VM* vm, const char* s, uint32_t len) {
-    uint32_t body_slots = (len + 7) / 8;
+    uint32_t body_slots = (len + 3) / 4;        /* 4 bytes per 32-bit slot */
     Cell* c = cell_alloc(vm, 1 + body_slots);
-    c->slots[0] = (uint64_t)len;
+    Val* slots = cell_slots(c);
+    slots[0] = (Val)len;
     cell_tag_set(c, 0, 0);
     for (uint32_t i = 0; i < body_slots; i++) {
-        uint64_t w = 0;
-        for (uint32_t j = 0; j < 8; j++) {
-            uint32_t k = i * 8 + j;
-            if (k < len) w |= ((uint64_t)(uint8_t)s[k]) << (j * 8);
+        uint32_t w = 0;
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t k = i * 4 + j;
+            if (k < len) w |= ((uint32_t)(uint8_t)s[k]) << (j * 8);
         }
-        c->slots[1 + i] = w;
+        slots[1 + i] = w;
         cell_tag_set(c, 1 + i, 0);
     }
     return c;
 }
 
-static uint32_t string_byte_len(Cell* c) {
-    return (uint32_t)c->slots[0];
-}
+static uint32_t string_byte_len(Cell* c) { return cell_slots(c)[0]; }
 
 static int string_byte_at(Cell* c, uint32_t i) {
     uint32_t len = string_byte_len(c);
     if (i >= len) return -1;
-    uint64_t w = c->slots[1 + (i / 8)];
-    return (int)((w >> ((i % 8) * 8)) & 0xFF);
+    Val w = cell_slots(c)[1 + (i / 4)];
+    return (int)((w >> ((i % 4) * 8)) & 0xFF);
 }
 
 static void string_write_stream(Cell* c, FILE* f) {
@@ -256,6 +349,8 @@ static Cart* load_cart(VM* vm, const char* path) {
     c->entry_fn_id = rd_u32(buf + pos); pos += 4;
     if (c->magic != MAGIC) die("bad magic");
     if (c->version != VERSION) die("unsupported version");
+    if (!(c->flags & FLAG_INT32_SAFE))
+        die("cart not INT32_SAFE; 32-bit runtime requires it");
 
     c->fn_count = rd_u32(buf + pos); pos += 4;
     if (c->entry_fn_id >= c->fn_count) die("entry_fn_id OOB");
@@ -318,7 +413,8 @@ static Cart* load_cart(VM* vm, const char* path) {
                 if (bit) {
                     uint64_t idx = fn->constants[k];
                     if (idx >= fn->string_count) die("handle const points past string pool");
-                    fn->constants[k] = (uint64_t)(uintptr_t)pool[idx];
+                    /* store the 32-bit arena handle (zero-extended) */
+                    fn->constants[k] = (uint64_t)C2H(vm, pool[idx]);
                 }
             }
             free(pool);
@@ -345,22 +441,19 @@ static Cart* load_cart(VM* vm, const char* path) {
     return c;
 }
 
-static Cell* coerce_string(uint64_t h) {
-    return (Cell*)(uintptr_t)h;
-}
-
 static Cell* string_from_cstr(VM* vm, const char* s) {
     return make_string_cell(vm, s, (uint32_t)strlen(s));
 }
 
-static Cell* int_to_string(VM* vm, int64_t v) {
+static Cell* int_to_string(VM* vm, int32_t v) {
     char buf[32];
-    int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+    int n = snprintf(buf, sizeof buf, "%d", v);
     return make_string_cell(vm, buf, (uint32_t)n);
 }
 
-static Cell* float_to_string(VM* vm, double d) {
+static Cell* float_to_string(VM* vm, float f) {
     char buf[64];
+    double d = (double)f;
     int n;
     if (isnan(d)) n = snprintf(buf, sizeof buf, "NaN");
     else if (isinf(d)) n = snprintf(buf, sizeof buf, d < 0 ? "-Inf" : "Inf");
@@ -370,68 +463,68 @@ static Cell* float_to_string(VM* vm, double d) {
 }
 
 typedef struct {
-    uint64_t value;
-    uint8_t  is_handle;
+    Val     value;
+    uint8_t is_handle;
 } NativeRet;
 
-static NativeRet nret_val(uint64_t v) { NativeRet r; r.value = v; r.is_handle = 0; return r; }
-static NativeRet nret_handle(Cell* c) { NativeRet r; r.value = (uint64_t)(uintptr_t)c; r.is_handle = 1; return r; }
+static NativeRet nret_val(Val v) { NativeRet r; r.value = v; r.is_handle = 0; return r; }
+static NativeRet nret_handle(VM* vm, Cell* c) { NativeRet r; r.value = C2H(vm, c); r.is_handle = 1; return r; }
 
-static NativeRet invoke_native(VM* vm, Function* fn, uint64_t* args, uint8_t* arg_tags) {
+static NativeRet invoke_native(VM* vm, Function* fn, Val* args, uint8_t* arg_tags) {
     const char* name = fn->name;
-    if (!strcmp(name, "print"))   { string_write_stream(coerce_string(args[0]), stdout); return nret_val(0); }
-    if (!strcmp(name, "println")) { string_write_stream(coerce_string(args[0]), stdout); fputc('\n', stdout); return nret_val(0); }
-    if (!strcmp(name, "ceil"))    return nret_val(d_to_u(ceil(u_to_d(args[0]))));
-    if (!strcmp(name, "flr"))     return nret_val(d_to_u(floor(u_to_d(args[0]))));
-    if (!strcmp(name, "cos"))     return nret_val(d_to_u(cos(u_to_d(args[0]))));
-    if (!strcmp(name, "sin"))     return nret_val(d_to_u(sin(u_to_d(args[0]))));
-    if (!strcmp(name, "sqrt"))    return nret_val(d_to_u(sqrt(u_to_d(args[0]))));
-    if (!strcmp(name, "max"))     { int64_t a=(int64_t)args[0],b=(int64_t)args[1]; return nret_val((uint64_t)(a>b?a:b)); }
-    if (!strcmp(name, "min"))     { int64_t a=(int64_t)args[0],b=(int64_t)args[1]; return nret_val((uint64_t)(a<b?a:b)); }
-    if (!strcmp(name, "abs"))     { int64_t a=(int64_t)args[0]; return nret_val((uint64_t)(a<0?-a:a)); }
-    if (!strcmp(name, "__float_max")) { double a=u_to_d(args[0]),b=u_to_d(args[1]); return nret_val(d_to_u(a>b?a:b)); }
-    if (!strcmp(name, "__float_min")) { double a=u_to_d(args[0]),b=u_to_d(args[1]); return nret_val(d_to_u(a<b?a:b)); }
-    if (!strcmp(name, "__float_abs")) return nret_val(d_to_u(fabs(u_to_d(args[0]))));
-    if (!strcmp(name, "__int_to_f"))  return nret_val(d_to_u((double)(int64_t)args[0]));
-    if (!strcmp(name, "__char_to_f")) return nret_val(d_to_u((double)(int64_t)args[0]));
-    if (!strcmp(name, "__bool_to_f")) return nret_val(d_to_u(args[0] ? 1.0 : 0.0));
-    if (!strcmp(name, "__float_to_i")) return nret_val((uint64_t)(int64_t)u_to_d(args[0]));
+    if (!strcmp(name, "print"))   { string_write_stream(H2C(vm, args[0]), stdout); return nret_val(0); }
+    if (!strcmp(name, "println")) { string_write_stream(H2C(vm, args[0]), stdout); fputc('\n', stdout); return nret_val(0); }
+    if (!strcmp(name, "ceil"))    return nret_val(f_to_u(ceilf(u_to_f(args[0]))));
+    if (!strcmp(name, "flr"))     return nret_val(f_to_u(floorf(u_to_f(args[0]))));
+    if (!strcmp(name, "cos"))     return nret_val(f_to_u(cosf(u_to_f(args[0]))));
+    if (!strcmp(name, "sin"))     return nret_val(f_to_u(sinf(u_to_f(args[0]))));
+    if (!strcmp(name, "sqrt"))    return nret_val(f_to_u(sqrtf(u_to_f(args[0]))));
+    if (!strcmp(name, "max"))     { int32_t a=(int32_t)args[0],b=(int32_t)args[1]; return nret_val((Val)(a>b?a:b)); }
+    if (!strcmp(name, "min"))     { int32_t a=(int32_t)args[0],b=(int32_t)args[1]; return nret_val((Val)(a<b?a:b)); }
+    if (!strcmp(name, "abs"))     { int32_t a=(int32_t)args[0]; return nret_val((Val)(a<0?-a:a)); }
+    if (!strcmp(name, "__float_max")) { float a=u_to_f(args[0]),b=u_to_f(args[1]); return nret_val(f_to_u(a>b?a:b)); }
+    if (!strcmp(name, "__float_min")) { float a=u_to_f(args[0]),b=u_to_f(args[1]); return nret_val(f_to_u(a<b?a:b)); }
+    if (!strcmp(name, "__float_abs")) return nret_val(f_to_u(fabsf(u_to_f(args[0]))));
+    if (!strcmp(name, "__int_to_f"))  return nret_val(f_to_u((float)(int32_t)args[0]));
+    if (!strcmp(name, "__char_to_f")) return nret_val(f_to_u((float)(int32_t)args[0]));
+    if (!strcmp(name, "__bool_to_f")) return nret_val(f_to_u(args[0] ? 1.0f : 0.0f));
+    if (!strcmp(name, "__float_to_i")) return nret_val((Val)(int32_t)u_to_f(args[0]));
     if (!strcmp(name, "__char_to_i")) return nret_val(args[0]);
     if (!strcmp(name, "__bool_to_i")) return nret_val(args[0] ? 1u : 0u);
     if (!strcmp(name, "__int_to_c"))  return nret_val(args[0] & 0xFFu);
-    if (!strcmp(name, "__int_to_s"))  return nret_handle(int_to_string(vm, (int64_t)args[0]));
-    if (!strcmp(name, "__float_to_s")) return nret_handle(float_to_string(vm, u_to_d(args[0])));
-    if (!strcmp(name, "__bool_to_s")) return nret_handle(string_from_cstr(vm, args[0] ? "true" : "false"));
-    if (!strcmp(name, "__char_to_s")) { char ch = (char)(args[0] & 0xFF); return nret_handle(make_string_cell(vm, &ch, 1)); }
-    if (!strcmp(name, "__string_to_s")) { vm_bump_handle(args[0]); return nret_handle((Cell*)(uintptr_t)args[0]); }
-    if (!strcmp(name, "__unit_to_s")) return nret_handle(string_from_cstr(vm, "()"));
+    if (!strcmp(name, "__int_to_s"))  return nret_handle(vm, int_to_string(vm, (int32_t)args[0]));
+    if (!strcmp(name, "__float_to_s")) return nret_handle(vm, float_to_string(vm, u_to_f(args[0])));
+    if (!strcmp(name, "__bool_to_s")) return nret_handle(vm, string_from_cstr(vm, args[0] ? "true" : "false"));
+    if (!strcmp(name, "__char_to_s")) { char ch = (char)(args[0] & 0xFF); return nret_handle(vm, make_string_cell(vm, &ch, 1)); }
+    if (!strcmp(name, "__string_to_s")) { vm_bump_handle(vm, args[0]); NativeRet r; r.value = args[0]; r.is_handle = 1; return r; }
+    if (!strcmp(name, "__unit_to_s")) return nret_handle(vm, string_from_cstr(vm, "()"));
     if (!strcmp(name, "__concat")) {
-        Cell* a = coerce_string(args[0]);
-        Cell* b = coerce_string(args[1]);
+        Cell* a = H2C(vm, args[0]);
+        Cell* b = H2C(vm, args[1]);
         uint32_t la = string_byte_len(a), lb = string_byte_len(b);
         uint32_t total = la + lb;
-        char* tmp = (char*)malloc(total);
+        char* tmp = (char*)malloc(total ? total : 1);
         for (uint32_t i = 0; i < la; i++) tmp[i] = (char)string_byte_at(a, i);
         for (uint32_t i = 0; i < lb; i++) tmp[la + i] = (char)string_byte_at(b, i);
         Cell* r = make_string_cell(vm, tmp, total);
         free(tmp);
-        return nret_handle(r);
+        return nret_handle(vm, r);
     }
     if (!strcmp(name, "__to_str")) {
-        if (arg_tags && arg_tags[0]) { vm_bump_handle(args[0]); return nret_handle((Cell*)(uintptr_t)args[0]); }
-        return nret_handle(int_to_string(vm, (int64_t)args[0]));
+        if (arg_tags && arg_tags[0]) { vm_bump_handle(vm, args[0]); NativeRet r; r.value = args[0]; r.is_handle = 1; return r; }
+        return nret_handle(vm, int_to_string(vm, (int32_t)args[0]));
     }
-    if (!strcmp(name, "__str_len")) return nret_val((uint64_t)(int64_t)string_byte_len(coerce_string(args[0])));
+    if (!strcmp(name, "__str_len")) return nret_val((Val)(int32_t)string_byte_len(H2C(vm, args[0])));
     if (!strcmp(name, "__str_byte_at")) {
-        Cell* s = coerce_string(args[0]);
-        int64_t i = (int64_t)args[1];
-        if (i < 0) return nret_val((uint64_t)-1);
+        Cell* s = H2C(vm, args[0]);
+        int32_t i = (int32_t)args[1];
+        if (i < 0) return nret_val((Val)-1);
         int b = string_byte_at(s, (uint32_t)i);
-        return nret_val((uint64_t)(int64_t)b);
+        return nret_val((Val)(int32_t)b);
     }
     if (!strcmp(name, "__str_eq")) {
-        Cell* a = coerce_string(args[0]);
-        Cell* b = coerce_string(args[1]);
+        Cell* a = H2C(vm, args[0]);
+        Cell* b = H2C(vm, args[1]);
         uint32_t la = string_byte_len(a), lb = string_byte_len(b);
         if (la != lb) return nret_val(0);
         for (uint32_t i = 0; i < la; i++) if (string_byte_at(a, i) != string_byte_at(b, i)) return nret_val(0);
@@ -466,19 +559,20 @@ static void validate_natives(Cart* c) {
     }
 }
 
-static uint64_t dei(VM* vm, uint16_t port, uint8_t* out_handle_tag) {
+static Val dei(VM* vm, uint16_t port, uint8_t* out_handle_tag) {
     *out_handle_tag = 0;
     uint8_t dev = (uint8_t)(port >> 8), p = (uint8_t)(port & 0xFF);
     if (dev == 0x00) {
-        /* Spec version split across fields (Runtime §6.1). */
+        /* Spec version split across 32-bit-readable fields (Runtime §6.1);
+         * the old 64-bit packing was unreadable on 32-bit carts. */
         if (p == 0x00) return SPEC_MAJOR;
-        if (p == 0x03) return (uint64_t)vm->cart->flags;
+        if (p == 0x03) return (Val)vm->cart->flags;
         if (p == 0x04) return SPEC_MINOR;
         if (p == 0x05) return SPEC_PATCH;
         die("DEI: bad System port");
     }
     if (dev == 0x10) {
-        if (p == 0x00) { int ch = getchar(); return ch == EOF ? (uint64_t)-1 : (uint64_t)(ch & 0xFF); }
+        if (p == 0x00) { int ch = getchar(); return ch == EOF ? (Val)-1 : (Val)(ch & 0xFF); }
         die("DEI: bad Console port");
     }
     die("DEI: absent device");
@@ -491,7 +585,7 @@ static void free_arm_chain(VM* vm, ArmSnap* a) {
         for (int i = 0; i < REGS_PER_FRAME; i++) {
             if (a->mask & (1ULL << i)) vm_drop_handle(vm, a->regs[i]);
         }
-        free(a);
+        arena_free(vm, a);
         a = p;
     }
 }
@@ -503,7 +597,7 @@ static void free_handler(VM* vm, Handler* h) {
                 if (h->last_cont->mask & (1ULL << i)) vm_drop_handle(vm, h->last_cont->regs[i]);
             }
         }
-        free(h->last_cont);
+        arena_free(vm, h->last_cont);
         h->last_cont = NULL;
     }
     free_arm_chain(vm, h->arm_cont);
@@ -518,63 +612,60 @@ static void region_push(VM* vm) {
     if (vm->rsp >= MAX_REGIONS) die("region stack overflow");
     Region* r = &vm->regions[vm->rsp++];
     r->id = ++vm->next_region_id;
-    r->cells = NULL;
-    r->count = 0;
-    r->cap = 0;
 }
 
+/* Force-free every cell attached to the popped region by scanning the arena. */
 static void region_pop(VM* vm) {
     if (vm->rsp == 0) die("region pop with empty stack");
     Region* r = &vm->regions[--vm->rsp];
-    for (uint32_t i = 0; i < r->count; i++) {
-        Cell* c = r->cells[i];
-        if (c->region_id != r->id) continue;
-        c->region_id = 0;
-        c->rc = 0;
-        c->gen++;
-        free(c->tags_ext);
-        free(c);
+    uint32_t id = r->id;
+    uint32_t off = 0;
+    while (off < vm->arena_size) {
+        BlkHdr* h = (BlkHdr*)(vm->arena + off);
+        if (h->size == 0) die("arena corrupt");
+        if (h->kind == BLK_CELL) {
+            Cell* c = (Cell*)(vm->arena + off + sizeof(BlkHdr));
+            if (c->region_id == id) {
+                /* force-free: bypass rc, no recursion (matches 64-bit runtime) */
+                c->region_id = 0;
+                c->rc = 0;
+                c->gen++;
+                h->kind = BLK_FREE;   /* coalesced lazily on next alloc */
+            }
+        }
+        off += h->size;
     }
-    free(r->cells);
-    r->cells = NULL;
-    r->count = r->cap = 0;
 }
 
-static void region_detach_walk(VM* vm, uint64_t h, uint32_t* visited, uint32_t* vn, uint32_t vcap) {
+static void region_detach_walk(VM* vm, Val h, Val* visited, uint32_t* vn, uint32_t vcap) {
     if (h == HANDLE_NONE || h == 0) return;
-    Cell* c = (Cell*)(uintptr_t)h;
-    for (uint32_t i = 0; i < *vn; i++) if (visited[i] == (uint32_t)(uintptr_t)c) return;
-    if (*vn < vcap) visited[(*vn)++] = (uint32_t)(uintptr_t)c;
+    Cell* c = H2C(vm, h);
+    for (uint32_t i = 0; i < *vn; i++) if (visited[i] == h) return;
+    if (*vn < vcap) visited[(*vn)++] = h;
     /* top-only (Runtime §5): detach + recurse only while the cell is attached
      * to the current top region; a cell in another region, no region, or
      * already forgotten stops this branch. */
     uint32_t top = (vm->rsp > 0) ? vm->regions[vm->rsp - 1].id : 0;
     if (top == 0 || c->region_id != top) return;
-    Region* r = &vm->regions[vm->rsp - 1];
-    for (uint32_t j = 0; j < r->count; j++) {
-        if (r->cells[j] == c) { r->cells[j] = r->cells[--r->count]; break; }
-    }
     c->region_id = 0;
+    Val* slots = cell_slots(c);
     for (uint32_t i = 0; i < c->size; i++) {
-        if (cell_tag_get(c, i)) region_detach_walk(vm, c->slots[i], visited, vn, vcap);
+        if (cell_tag_get(c, i)) region_detach_walk(vm, slots[i], visited, vn, vcap);
     }
 }
 
-static void region_deep_forget(VM* vm, uint64_t h) {
-    uint32_t visited[4096];
+static void region_deep_forget(VM* vm, Val h) {
+    Val visited[4096];
     uint32_t vn = 0;
     region_detach_walk(vm, h, visited, &vn, 4096);
 }
 
-static void dispatch_lookup(VM* vm, uint16_t effect_id, uint8_t op_id, Handler** out_h, uint16_t* out_fn, uint64_t* out_env, uint8_t* out_env_is_handle);
-
-static void deo(VM* vm, uint16_t port, uint64_t v, uint8_t v_is_handle) {
+static void deo(VM* vm, uint16_t port, Val v, uint8_t v_is_handle) {
     uint8_t dev = (uint8_t)(port >> 8), p = (uint8_t)(port & 0xFF);
     if (dev == 0x00) {
         if (p == 0x01) { vm->halted = 1; vm->exit_code = (uint32_t)v; return; }
         if (p == 0x02) {
-            Cell* s = coerce_string(v);
-            if (s) string_write_stream(s, stderr);
+            if (v != 0 && v != HANDLE_NONE) string_write_stream(H2C(vm, v), stderr);
             fputc('\n', stderr);
             vm->halted = 1;
             vm->exit_code = 1;
@@ -607,7 +698,7 @@ static void deo(VM* vm, uint16_t port, uint64_t v, uint8_t v_is_handle) {
             if (h->pending_arm_env_is_handle) vm_drop_handle(vm, h->pending_arm_env);
             h->pending_arm_env = v;
             h->pending_arm_env_is_handle = v_is_handle;
-            if (v_is_handle) vm_bump_handle(v);
+            if (v_is_handle) vm_bump_handle(vm, v);
             return;
         }
         die("DEO: bad Dispatch port");
@@ -621,7 +712,7 @@ static void deo(VM* vm, uint16_t port, uint64_t v, uint8_t v_is_handle) {
     die("DEO: absent device");
 }
 
-static void dispatch_lookup(VM* vm, uint16_t effect_id, uint8_t op_id, Handler** out_h, uint16_t* out_fn, uint64_t* out_env, uint8_t* out_env_is_handle) {
+static void dispatch_lookup(VM* vm, uint16_t effect_id, uint8_t op_id, Handler** out_h, uint16_t* out_fn, Val* out_env, uint8_t* out_env_is_handle) {
     *out_h = NULL;
     *out_fn = DISPATCH_MISS;
     *out_env = 0;
@@ -630,15 +721,16 @@ static void dispatch_lookup(VM* vm, uint16_t effect_id, uint8_t op_id, Handler**
         Handler* h = &vm->handlers[i];
         if (h->effect_id != effect_id) continue;
         if (h->dispatch == HANDLE_NONE || h->dispatch == 0) continue;
-        Cell* dt = (Cell*)(uintptr_t)h->dispatch;
+        Cell* dt = H2C(vm, h->dispatch);
         uint32_t idx_fn = (uint32_t)op_id * 2;
         uint32_t idx_env = idx_fn + 1;
         if (idx_env >= dt->size) continue;
-        uint64_t f = dt->slots[idx_fn] & 0xFFFFu;
+        Val* slots = cell_slots(dt);
+        uint32_t f = slots[idx_fn] & 0xFFFFu;
         if (f == DISPATCH_MISS) continue;
         *out_h = h;
         *out_fn = (uint16_t)f;
-        *out_env = dt->slots[idx_env];
+        *out_env = slots[idx_env];
         *out_env_is_handle = cell_tag_get(dt, idx_env) ? 1 : 0;
         return;
     }
@@ -652,7 +744,7 @@ static Handler* active_handler(VM* vm) {
     return NULL;
 }
 
-static void write_reg(VM* vm, Frame* fr, uint8_t r, uint64_t v, uint8_t is_handle) {
+static void write_reg(VM* vm, Frame* fr, uint8_t r, Val v, uint8_t is_handle) {
     if (fr->mask & (1ULL << r)) vm_drop_handle(vm, vm->regs[fr->base + r]);
     vm->regs[fr->base + r] = v;
     if (is_handle) fr->mask |= (1ULL << r);
@@ -665,8 +757,8 @@ static void do_call(VM* vm, Frame* caller, Function* caller_fn, uint16_t target_
     uint32_t new_base = caller->base + caller_fn->reg_count;
 
     if (tgt->kind == 0x01) {
-        uint64_t args_copy[REGS_PER_FRAME];
-        uint8_t  arg_tags[REGS_PER_FRAME];
+        Val     args_copy[REGS_PER_FRAME];
+        uint8_t arg_tags[REGS_PER_FRAME];
         for (uint8_t i = 0; i < tgt->param_count; i++) {
             args_copy[i] = vm->regs[new_base + i];
             arg_tags[i] = (caller->mask >> (caller_fn->reg_count + i)) & 1;
@@ -708,14 +800,14 @@ static void do_call(VM* vm, Frame* caller, Function* caller_fn, uint16_t target_
     }
 }
 
-static void do_ret(VM* vm, uint64_t v, uint8_t v_is_handle) {
+static void do_ret(VM* vm, Val v, uint8_t v_is_handle) {
     Frame* fr = &vm->stack[vm->sp];
 
     for (uint32_t i = vm->hsp; i-- > 0;) {
         Handler* h = &vm->handlers[i];
         if (h->body_sp == vm->sp && h->pending_arm_fn != DISPATCH_MISS) {
             uint16_t arm_fn = h->pending_arm_fn;
-            uint64_t env = h->pending_arm_env;
+            Val env = h->pending_arm_env;
             uint8_t env_h = h->pending_arm_env_is_handle;
             h->pending_arm_fn = DISPATCH_MISS;
             h->pending_arm_env = 0;
@@ -744,11 +836,11 @@ static void do_ret(VM* vm, uint64_t v, uint8_t v_is_handle) {
             fr->ip    = as->ip;
             fr->base  = as->base;
             fr->mask  = as->mask;
-            memcpy(&vm->regs[as->base], as->regs, sizeof(uint64_t) * REGS_PER_FRAME);
+            memcpy(&vm->regs[as->base], as->regs, sizeof(Val) * REGS_PER_FRAME);
             vm->regs[as->base + as->ra] = v;
             if (v_is_handle) fr->mask |= (1ULL << as->ra);
             else             fr->mask &= ~(1ULL << as->ra);
-            free(as);
+            arena_free(vm, as);
             return;
         }
     }
@@ -768,13 +860,13 @@ static void do_ret(VM* vm, uint64_t v, uint8_t v_is_handle) {
 
 static void do_raise(VM* vm, uint8_t dest_a, uint8_t key_reg, uint8_t args_base) {
     Frame* fr = &vm->stack[vm->sp];
-    uint64_t key = vm->regs[fr->base + key_reg];
+    Val key = vm->regs[fr->base + key_reg];
     uint16_t effect_id = (uint16_t)(key >> 8);
     uint8_t  op_id     = (uint8_t)(key & 0xFF);
 
     Handler* h;
     uint16_t arm_fn;
-    uint64_t env;
+    Val      env;
     uint8_t  env_is_handle;
     dispatch_lookup(vm, effect_id, op_id, &h, &arm_fn, &env, &env_is_handle);
     if (!h) die("raise: no matching handler");
@@ -784,15 +876,16 @@ static void do_raise(VM* vm, uint8_t dest_a, uint8_t key_reg, uint8_t args_base)
     if (af->param_count < 2) die("raise: arm param_count < 2");
     uint8_t nargs = af->param_count - 2;
 
-    if (h->last_cont) { free(h->last_cont); h->last_cont = NULL; }
-    ContCell* cc = (ContCell*)calloc(1, sizeof(ContCell));
+    if (h->last_cont) { arena_free(vm, h->last_cont); h->last_cont = NULL; }
+    ContCell* cc = (ContCell*)arena_alloc(vm, sizeof(ContCell), BLK_RAW);
+    if (!cc) die("oom");
     cc->mask     = fr->mask;
     cc->body_sp  = vm->sp;
     cc->consumed = 0;
     cc->region_id = vm->rsp ? vm->regions[vm->rsp - 1].id : 0;
-    memcpy(cc->regs, &vm->regs[fr->base], sizeof(uint64_t) * REGS_PER_FRAME);
+    memcpy(cc->regs, &vm->regs[fr->base], sizeof(Val) * REGS_PER_FRAME);
     for (int i = 0; i < REGS_PER_FRAME; i++) {
-        if (cc->mask & (1ULL << i)) vm_bump_handle(cc->regs[i]);
+        if (cc->mask & (1ULL << i)) vm_bump_handle(vm, cc->regs[i]);
     }
     h->last_cont = cc;
 
@@ -809,7 +902,7 @@ static void do_raise(VM* vm, uint8_t dest_a, uint8_t key_reg, uint8_t args_base)
     af_fr->mask  = 0;
 
     vm->regs[arm_base + 0] = env;
-    if (env_is_handle) { af_fr->mask |= 1ULL << 0; vm_bump_handle(env); }
+    if (env_is_handle) { af_fr->mask |= 1ULL << 0; vm_bump_handle(vm, env); }
     vm->regs[arm_base + 1] = 0;
     for (uint8_t i = 0; i < nargs; i++) {
         uint8_t src = args_base + i;
@@ -821,7 +914,7 @@ static void do_raise(VM* vm, uint8_t dest_a, uint8_t key_reg, uint8_t args_base)
     }
 }
 
-static void do_resume(VM* vm, uint8_t ra_idx, uint64_t value, uint8_t value_is_handle) {
+static void do_resume(VM* vm, uint8_t ra_idx, Val value, uint8_t value_is_handle) {
     Handler* h = active_handler(vm);
     if (!h) die("resume: no continuation");
     ContCell* cc = h->last_cont;
@@ -829,21 +922,22 @@ static void do_resume(VM* vm, uint8_t ra_idx, uint64_t value, uint8_t value_is_h
     if (vm->sp == 0) die("resume: arm frame missing");
 
     Frame* arm_fr = &vm->stack[vm->sp];
-    ArmSnap* as = (ArmSnap*)calloc(1, sizeof(ArmSnap));
+    ArmSnap* as = (ArmSnap*)arena_alloc(vm, sizeof(ArmSnap), BLK_RAW);
+    if (!as) die("oom");
     as->fn_id = arm_fr->fn_id;
     as->ip    = arm_fr->ip;
     as->base  = arm_fr->base;
     as->dest  = arm_fr->dest;
     as->mask  = arm_fr->mask;
     as->sp    = vm->sp;
-    memcpy(as->regs, &vm->regs[arm_fr->base], sizeof(uint64_t) * REGS_PER_FRAME);
+    memcpy(as->regs, &vm->regs[arm_fr->base], sizeof(Val) * REGS_PER_FRAME);
     as->ra    = ra_idx;
     as->prev  = h->arm_cont;
     h->arm_cont = as;
 
     uint32_t body_sp = cc->body_sp;
     Frame* body_fr = &vm->stack[body_sp];
-    memcpy(&vm->regs[body_fr->base], cc->regs, sizeof(uint64_t) * REGS_PER_FRAME);
+    memcpy(&vm->regs[body_fr->base], cc->regs, sizeof(Val) * REGS_PER_FRAME);
     body_fr->mask = cc->mask;
     vm->regs[body_fr->base + arm_fr->dest] = value;
     if (value_is_handle) body_fr->mask |= (1ULL << arm_fr->dest);
@@ -868,27 +962,28 @@ static void run(VM* vm) {
         const uint8_t* ins = fn->code + (size_t)fr->ip * 4;
         uint8_t op = ins[0], a = ins[1], b = ins[2], c = ins[3];
         uint32_t ra = fr->base + a, rb = fr->base + b, rc = fr->base + c;
-        uint64_t* R = vm->regs;
+        Val* R = vm->regs;
         fr->ip++;
 
         switch (op) {
             case 0x00: R[ra] = R[rb] + R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x01: R[ra] = R[rb] - R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x02: R[ra] = R[rb] * R[rc]; fr->mask &= ~(1ULL << a); break;
-            case 0x03: if (!R[rc]) die("div by zero"); R[ra] = (uint64_t)((int64_t)R[rb] / (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x04: if (!R[rc]) die("mod by zero"); R[ra] = (uint64_t)((int64_t)R[rb] % (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x05: R[ra] = (uint64_t)(-(int64_t)R[rb]); fr->mask &= ~(1ULL << a); break;
+            case 0x03: if (!R[rc]) die("div by zero"); R[ra] = (Val)((int32_t)R[rb] / (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x04: if (!R[rc]) die("mod by zero"); R[ra] = (Val)((int32_t)R[rb] % (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x05: R[ra] = (Val)(-(int32_t)R[rb]); fr->mask &= ~(1ULL << a); break;
             case 0x06: R[ra] = (R[rb] == R[rc]); fr->mask &= ~(1ULL << a); break;
             case 0x07: R[ra] = (R[rb] != R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x08: R[ra] = ((int64_t)R[rb] <  (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x09: R[ra] = ((int64_t)R[rb] >  (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x0A: R[ra] = ((int64_t)R[rb] <= (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
-            case 0x0B: R[ra] = ((int64_t)R[rb] >= (int64_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x08: R[ra] = ((int32_t)R[rb] <  (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x09: R[ra] = ((int32_t)R[rb] >  (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x0A: R[ra] = ((int32_t)R[rb] <= (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
+            case 0x0B: R[ra] = ((int32_t)R[rb] >= (int32_t)R[rc]); fr->mask &= ~(1ULL << a); break;
             case 0x0C: R[ra] = R[rb] & R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x0D: R[ra] = R[rb] | R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x0E: R[ra] = R[rb] ^ R[rc]; fr->mask &= ~(1ULL << a); break;
-            case 0x0F: R[ra] = R[rb] << (R[rc] & 63); fr->mask &= ~(1ULL << a); break;
-            case 0x10: R[ra] = (uint64_t)((int64_t)R[rb] >> (R[rc] & 63)); fr->mask &= ~(1ULL << a); break;
+            /* 32-bit storage: shift count masked to 31 to stay defined */
+            case 0x0F: R[ra] = R[rb] << (R[rc] & 31); fr->mask &= ~(1ULL << a); break;
+            case 0x10: R[ra] = (Val)((int32_t)R[rb] >> (R[rc] & 31)); fr->mask &= ~(1ULL << a); break;
             case 0x11: { int16_t off = (int16_t)(b | (c << 8)); fr->ip = (uint32_t)((int32_t)fr->ip + off); break; }
             case 0x12: { int16_t off = (int16_t)(b | (c << 8)); if (R[ra] == 0) fr->ip = (uint32_t)((int32_t)fr->ip + off); break; }
             case 0x13: { int16_t off = (int16_t)(b | (c << 8)); if (R[ra] != 0) fr->ip = (uint32_t)((int32_t)fr->ip + off); break; }
@@ -896,7 +991,7 @@ static void run(VM* vm) {
             case 0x16: do_call(vm, fr, fn, (uint16_t)R[rb], a); break;
             case 0x15: {
                 uint8_t v_h = (fr->mask >> a) & 1;
-                uint64_t v = R[ra];
+                Val v = R[ra];
                 if (v_h) fr->mask &= ~(1ULL << a);
                 do_ret(vm, v, v_h);
                 break;
@@ -905,20 +1000,20 @@ static void run(VM* vm) {
                 uint16_t idx = (uint16_t)(b | (c << 8));
                 if (idx >= fn->const_count) die("pushconst idx OOB");
                 uint8_t bit = (fn->const_mask[idx / 8] >> (idx % 8)) & 1;
-                uint64_t v = fn->constants[idx];
-                if (bit) vm_bump_handle(v);
+                Val v = (Val)fn->constants[idx];     /* low 32 bits */
+                if (bit) vm_bump_handle(vm, v);
                 write_reg(vm, fr, a, v, bit);
                 break;
             }
             case 0x18: {
                 uint8_t src_h = (fr->mask >> b) & 1;
-                if (src_h) vm_bump_handle(R[rb]);
+                if (src_h) vm_bump_handle(vm, R[rb]);
                 write_reg(vm, fr, a, R[rb], src_h);
                 break;
             }
             case 0x19: {
                 uint8_t src_h = (fr->mask >> b) & 1;
-                uint64_t v = R[rb];
+                Val v = R[rb];
                 R[rb] = 0;
                 fr->mask &= ~(1ULL << b);
                 write_reg(vm, fr, a, v, src_h);
@@ -926,54 +1021,58 @@ static void run(VM* vm) {
             }
             case 0x1A: {
                 if (R[rb] == HANDLE_NONE || R[rb] == 0) die("ld: null handle");
-                Cell* p = (Cell*)(uintptr_t)R[rb];
+                Cell* p = H2C(vm, R[rb]);
                 if (c >= p->size) die("ld OOB");
-                uint64_t v = p->slots[c];
+                Val* slots = cell_slots(p);
+                Val v = slots[c];
                 int slot_h = cell_tag_get(p, c);
-                if (slot_h) vm_bump_handle(v);
+                if (slot_h) vm_bump_handle(vm, v);
                 write_reg(vm, fr, a, v, (uint8_t)slot_h);
                 break;
             }
             case 0x1B: {
                 if (R[rb] == HANDLE_NONE || R[rb] == 0) die("st: null handle");
-                Cell* p = (Cell*)(uintptr_t)R[rb];
+                Cell* p = H2C(vm, R[rb]);
                 if (c >= p->size) die("st OOB");
+                Val* slots = cell_slots(p);
                 int prev_h = cell_tag_get(p, c);
-                if (prev_h) vm_drop_handle(vm, p->slots[c]);
+                if (prev_h) vm_drop_handle(vm, slots[c]);
                 uint8_t src_h = (fr->mask >> a) & 1;
-                if (src_h) vm_bump_handle(R[ra]);
-                p->slots[c] = R[ra];
+                if (src_h) vm_bump_handle(vm, R[ra]);
+                slots[c] = R[ra];
                 cell_tag_set(p, c, src_h);
                 break;
             }
             case 0x1C: {
                 if (R[rb] == HANDLE_NONE || R[rb] == 0) die("ldidx: null handle");
-                Cell* p = (Cell*)(uintptr_t)R[rb];
-                uint64_t i = R[rc];
+                Cell* p = H2C(vm, R[rb]);
+                Val i = R[rc];
                 if (i >= p->size) die("ldidx OOB");
-                uint64_t v = p->slots[i];
-                int slot_h = cell_tag_get(p, (uint32_t)i);
-                if (slot_h) vm_bump_handle(v);
+                Val* slots = cell_slots(p);
+                Val v = slots[i];
+                int slot_h = cell_tag_get(p, i);
+                if (slot_h) vm_bump_handle(vm, v);
                 write_reg(vm, fr, a, v, (uint8_t)slot_h);
                 break;
             }
             case 0x1D: {
                 if (R[rb] == HANDLE_NONE || R[rb] == 0) die("stidx: null handle");
-                Cell* p = (Cell*)(uintptr_t)R[rb];
-                uint64_t i = R[rc];
+                Cell* p = H2C(vm, R[rb]);
+                Val i = R[rc];
                 if (i >= p->size) die("stidx OOB");
-                int prev_h = cell_tag_get(p, (uint32_t)i);
-                if (prev_h) vm_drop_handle(vm, p->slots[i]);
+                Val* slots = cell_slots(p);
+                int prev_h = cell_tag_get(p, i);
+                if (prev_h) vm_drop_handle(vm, slots[i]);
                 uint8_t src_h = (fr->mask >> a) & 1;
-                if (src_h) vm_bump_handle(R[ra]);
-                p->slots[i] = R[ra];
-                cell_tag_set(p, (uint32_t)i, src_h);
+                if (src_h) vm_bump_handle(vm, R[ra]);
+                slots[i] = R[ra];
+                cell_tag_set(p, i, src_h);
                 break;
             }
             case 0x1E: {
                 uint16_t sz = (uint16_t)(b | (c << 8));
                 Cell* p = cell_alloc(vm, sz);
-                write_reg(vm, fr, a, (uint64_t)(uintptr_t)p, 1);
+                write_reg(vm, fr, a, C2H(vm, p), 1);
                 break;
             }
             case 0x1F: {
@@ -985,7 +1084,6 @@ static void run(VM* vm) {
             case 0x20: {
                 uint8_t h_tag;
                 R[ra] = dei(vm, (uint16_t)R[rb], &h_tag);
-                if (fr->mask & (1ULL << a)) vm_drop_handle(vm, 0);
                 fr->mask &= ~(1ULL << a);
                 if (h_tag) fr->mask |= (1ULL << a);
                 break;
@@ -1002,7 +1100,7 @@ static void run(VM* vm) {
                 h->effect_id          = (uint16_t)(b | (c << 8));
                 h->dispatch           = R[ra];
                 h->dispatch_is_handle = (fr->mask >> a) & 1;
-                if (h->dispatch_is_handle) vm_bump_handle(h->dispatch);
+                if (h->dispatch_is_handle) vm_bump_handle(vm, h->dispatch);
                 h->install_sp         = vm->sp;
                 h->body_sp            = 0;
                 h->pending_arm_fn     = DISPATCH_MISS;
@@ -1014,7 +1112,7 @@ static void run(VM* vm) {
             }
             case 0x23: {
                 uint8_t src_h = (fr->mask >> b) & 1;
-                uint64_t v = R[rb];
+                Val v = R[rb];
                 if (src_h) {
                     fr->mask &= ~(1ULL << b);
                     R[rb] = 0;
@@ -1022,15 +1120,15 @@ static void run(VM* vm) {
                 do_resume(vm, a, v, src_h);
                 break;
             }
-            case 0x24: R[ra] = R[rb] + (uint64_t)(int64_t)(int8_t)c; fr->mask &= ~(1ULL << a); break;
-            case 0x25: R[ra] = R[rb] - (uint64_t)(int64_t)(int8_t)c; fr->mask &= ~(1ULL << a); break;
-            case 0x26: R[ra] = d_to_u(u_to_d(R[rb]) + u_to_d(R[rc])); fr->mask &= ~(1ULL << a); break;
-            case 0x27: R[ra] = d_to_u(u_to_d(R[rb]) - u_to_d(R[rc])); fr->mask &= ~(1ULL << a); break;
-            case 0x28: R[ra] = d_to_u(u_to_d(R[rb]) * u_to_d(R[rc])); fr->mask &= ~(1ULL << a); break;
-            case 0x29: R[ra] = d_to_u(u_to_d(R[rb]) / u_to_d(R[rc])); fr->mask &= ~(1ULL << a); break;
-            case 0x2A: R[ra] = d_to_u(-u_to_d(R[rb])); fr->mask &= ~(1ULL << a); break;
-            case 0x2B: { double x = u_to_d(R[rb]), y = u_to_d(R[rc]); R[ra] = (x == x && y == y && x < y) ? 1 : 0; fr->mask &= ~(1ULL << a); break; }
-            case 0x2C: { double x = u_to_d(R[rb]), y = u_to_d(R[rc]); R[ra] = (x == x && y == y && x == y) ? 1 : 0; fr->mask &= ~(1ULL << a); break; }
+            case 0x24: R[ra] = R[rb] + (Val)(int32_t)(int8_t)c; fr->mask &= ~(1ULL << a); break;
+            case 0x25: R[ra] = R[rb] - (Val)(int32_t)(int8_t)c; fr->mask &= ~(1ULL << a); break;
+            case 0x26: R[ra] = f_to_u(u_to_f(R[rb]) + u_to_f(R[rc])); fr->mask &= ~(1ULL << a); break;
+            case 0x27: R[ra] = f_to_u(u_to_f(R[rb]) - u_to_f(R[rc])); fr->mask &= ~(1ULL << a); break;
+            case 0x28: R[ra] = f_to_u(u_to_f(R[rb]) * u_to_f(R[rc])); fr->mask &= ~(1ULL << a); break;
+            case 0x29: R[ra] = f_to_u(u_to_f(R[rb]) / u_to_f(R[rc])); fr->mask &= ~(1ULL << a); break;
+            case 0x2A: R[ra] = f_to_u(-u_to_f(R[rb])); fr->mask &= ~(1ULL << a); break;
+            case 0x2B: { float x = u_to_f(R[rb]), y = u_to_f(R[rc]); R[ra] = (x == x && y == y && x < y) ? 1 : 0; fr->mask &= ~(1ULL << a); break; }
+            case 0x2C: { float x = u_to_f(R[rb]), y = u_to_f(R[rc]); R[ra] = (x == x && y == y && x == y) ? 1 : 0; fr->mask &= ~(1ULL << a); break; }
             case 0x2D: do_raise(vm, a, b, c); break;
             default: die("reserved opcode");
         }
@@ -1041,22 +1139,28 @@ int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <cart.pk>\n", argv[0]); return 2; }
     VM* vm = (VM*)calloc(1, sizeof(VM));
     if (!vm) die("oom");
+
+    if (sizeof(VM) + (sizeof(BlkHdr) + 4) >= TOTAL_RAM) die("VM overhead exceeds RAM budget");
+    vm->arena_size = TOTAL_RAM - (uint32_t)sizeof(VM);
+    vm->arena = (uint8_t*)malloc(vm->arena_size);
+    if (!vm->arena) die("oom");
+    arena_init(vm);
+
     vm->cart = load_cart(vm, argv[1]);
     validate_natives(vm->cart);
 
-    Function* entry = &vm->cart->fns[vm->cart->entry_fn_id];
     vm->stack[0].fn_id = (uint16_t)vm->cart->entry_fn_id;
     vm->stack[0].ip    = 0;
     vm->stack[0].base  = 0;
     vm->stack[0].dest  = 0;
     vm->stack[0].mask  = 0;
     vm->sp = 0;
-    (void)entry;
 
     run(vm);
     fflush(stdout);
     fflush(stderr);
     int code = (int)vm->exit_code;
+    free(vm->arena);
     free(vm);
     return code;
 }

@@ -1,4 +1,5 @@
 myriad
+myriad32
 *.o
 *.dSYM
 .DS_Store
