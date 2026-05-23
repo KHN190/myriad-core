@@ -4,23 +4,8 @@
  * Same Polka cartridge format as the 64-bit runtime (main.c); the only
  * cart-side difference is the INT32_SAFE flag (Polka header bit 0). When set,
  * every Int constant / arithmetic result fits in i32 and every Float is exactly
- * representable as f32. This runtime takes the spec up on the "use 32-bit
- * storage" option:
+ * representable as f32. 
  *
- *   - registers, cell slots, constants, and call args/returns are 32-bit;
- *   - integer ops wrap mod 2^32, comparisons/div/mod/neg are signed i32;
- *   - float ops are IEEE-754 f32;
- *   - handles are byte offsets into a single fixed heap arena, not host
- *     pointers (a 64-bit pointer cannot live in a 32-bit register);
- *   - the whole VM footprint (register file + call stack + handler/region
- *     stacks + heap arena) is bounded to TOTAL_RAM (4 MB).
- *
- * Because storage is 32-bit, this runtime requires INT32_SAFE; a cart without
- * it could carry values that don't fit and is rejected at load time.
- *
- * Constant note: INT32_SAFE constants are read as the low 32 bits of each u64
- * cart slot. The compiler is expected to emit i32 values and f32 bit patterns
- * zero-extended into those slots.
  */
 
 #include <math.h>
@@ -33,45 +18,32 @@
 #define MAGIC           0xECFF00ECu
 #define VERSION         0x0201
 #define FLAG_INT32_SAFE 0x0001u
-#define SPEC_MAJOR      0u   /* reported via System 0x00 / 0x04 / 0x05 */
+#define SPEC_MAJOR      0u
 #define SPEC_MINOR      1u
 #define SPEC_PATCH      0u
 #define REGS_PER_FRAME  64
-#define TOTAL_RAM       (4u * 1024 * 1024)  /* whole-VM ceiling */
-#define MAX_FRAMES      512                 /* regs[] = 64*512*4 = 128 KB */
+#define TOTAL_RAM       (4u * 1024 * 1024)
+#define MAX_FRAMES      512
 #define MAX_REGS        (REGS_PER_FRAME * MAX_FRAMES)
 #define MAX_HANDLERS    64
 #define MAX_REGIONS     64
 #define DISPATCH_MISS   0xFFFFu
-#define HANDLE_NONE     0xFFFFFFFFu         /* null handle in 32-bit storage */
+#define HANDLE_NONE     0xFFFFFFFFu
 
-/* A register/slot/constant value: untagged 32 bits. */
 typedef uint32_t Val;
 
-/*
- * Heap arena. A fixed byte buffer carved into blocks by a first-fit free-list
- * allocator. Each block has an 8-byte header; the payload follows. A Cell
- * handle is the byte offset of the Cell (the block payload) within the arena.
- * Offset 0 is always a block header, never a payload, so handle 0 and
- * HANDLE_NONE are both safe null sentinels.
- */
 #define BLK_FREE 0u
-#define BLK_CELL 1u   /* payload is a Cell; participates in region scan */
-#define BLK_RAW  2u   /* payload is runtime bookkeeping (ContCell/ArmSnap) */
+#define BLK_CELL 1u
+#define BLK_RAW  2u
 
 typedef struct {
-    uint32_t size;   /* total bytes including this header, multiple of 4 */
-    uint32_t kind;   /* BLK_* */
+    uint32_t size;
+    uint32_t kind;
 } BlkHdr;
 
-/*
- * Cell header. Tag words and slots follow inline (no separate allocations):
- *   [Cell][ceil(size/32) u32 tag words][size u32 slots]
- * Each slot carries a value/handle tag bit, observable through opcodes.
- */
 typedef struct Cell {
     uint32_t rc;
-    uint32_t size;       /* slot count */
+    uint32_t size;
     uint32_t gen;
     uint32_t region_id;
 } Cell;
@@ -84,7 +56,7 @@ typedef struct {
     uint16_t  string_count;
     uint32_t  code_count;
     uint16_t  name_len;
-    uint64_t* constants;     /* raw cart constants (u64); loaded as low-32 */
+    uint64_t* constants;
     uint8_t*  const_mask;
     uint8_t*  code;
     char*     name;
@@ -104,7 +76,7 @@ typedef struct {
     uint32_t ip;
     uint32_t base;
     uint8_t  dest;
-    uint64_t mask;       /* one handle/value bit per register in the window */
+    uint64_t mask;
 } Frame;
 
 typedef struct ContCell {
@@ -129,19 +101,19 @@ typedef struct ArmSnap {
 
 typedef struct {
     uint16_t  effect_id;
-    Val       dispatch;            /* dispatch-table handle */
+    Val       dispatch;
     uint8_t   dispatch_is_handle;
     uint32_t  install_sp;
     uint32_t  body_sp;
     uint16_t  pending_arm_fn;
     Val       pending_arm_env;
     uint8_t   pending_arm_env_is_handle;
-    ContCell* last_cont;           /* host ptr into the (immovable) arena */
+    ContCell* last_cont;
     ArmSnap*  arm_cont;
 } Handler;
 
 typedef struct {
-    uint32_t id;                   /* membership tracked via Cell.region_id */
+    uint32_t id;
 } Region;
 
 typedef struct {
@@ -173,22 +145,16 @@ static uint32_t rd_u32(const uint8_t* p) {
 static uint64_t rd_u64(const uint8_t* p) {
     return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
 }
-
-/* f32 bit reinterpretation (was f64 in the 64-bit runtime). */
 static float    u_to_f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
 static uint32_t f_to_u(float f)    { union { uint32_t u; float f; } v; v.f = f; return v.u; }
 
-/* ---- Arena allocator ---------------------------------------------------- */
-
 static void arena_init(VM* vm) {
-    vm->arena_size &= ~7u;                  /* keep blocks 4-aligned, sizes even */
+    vm->arena_size &= ~7u;
     if (vm->arena_size < sizeof(BlkHdr) + 4) die("arena too small");
     BlkHdr* h = (BlkHdr*)vm->arena;
     h->size = vm->arena_size;
     h->kind = BLK_FREE;
 }
-
-/* Allocate a zeroed payload of >= nbytes; returns NULL when the arena is full. */
 static void* arena_alloc(VM* vm, uint32_t nbytes, uint32_t kind) {
     uint32_t need = (uint32_t)sizeof(BlkHdr) + ((nbytes + 3u) & ~3u);
     if (need < sizeof(BlkHdr) + 4) need = sizeof(BlkHdr) + 4;
@@ -198,7 +164,6 @@ static void* arena_alloc(VM* vm, uint32_t nbytes, uint32_t kind) {
         BlkHdr* h = (BlkHdr*)(vm->arena + off);
         if (h->size == 0) die("arena corrupt");
         if (h->kind == BLK_FREE) {
-            /* lazily coalesce following free blocks (also covers prev-merges) */
             uint32_t end = off + h->size;
             while (end < vm->arena_size) {
                 BlkHdr* nh = (BlkHdr*)(vm->arena + end);
@@ -236,8 +201,6 @@ static void arena_free(VM* vm, void* payload) {
         if (nh->kind == BLK_FREE) h->size += nh->size;
     }
 }
-
-/* ---- Handle <-> Cell pointer -------------------------------------------- */
 
 static Cell* H2C(VM* vm, Val h) { return (Cell*)(vm->arena + h); }
 static Val   C2H(VM* vm, Cell* c) { return (Val)((uint8_t*)c - vm->arena); }
@@ -290,7 +253,7 @@ static void vm_bump_handle(VM* vm, Val h) {
 }
 
 static Cell* make_string_cell(VM* vm, const char* s, uint32_t len) {
-    uint32_t body_slots = (len + 3) / 4;        /* 4 bytes per 32-bit slot */
+    uint32_t body_slots = (len + 3) / 4;
     Cell* c = cell_alloc(vm, 1 + body_slots);
     Val* slots = cell_slots(c);
     slots[0] = (Val)len;
@@ -413,7 +376,6 @@ static Cart* load_cart(VM* vm, const char* path) {
                 if (bit) {
                     uint64_t idx = fn->constants[k];
                     if (idx >= fn->string_count) die("handle const points past string pool");
-                    /* store the 32-bit arena handle (zero-extended) */
                     fn->constants[k] = (uint64_t)C2H(vm, pool[idx]);
                 }
             }
@@ -613,8 +575,6 @@ static void region_push(VM* vm) {
     Region* r = &vm->regions[vm->rsp++];
     r->id = ++vm->next_region_id;
 }
-
-/* Force-free every cell attached to the popped region by scanning the arena. */
 static void region_pop(VM* vm) {
     if (vm->rsp == 0) die("region pop with empty stack");
     Region* r = &vm->regions[--vm->rsp];
@@ -626,11 +586,10 @@ static void region_pop(VM* vm) {
         if (h->kind == BLK_CELL) {
             Cell* c = (Cell*)(vm->arena + off + sizeof(BlkHdr));
             if (c->region_id == id) {
-                /* force-free: bypass rc, no recursion (matches 64-bit runtime) */
                 c->region_id = 0;
                 c->rc = 0;
                 c->gen++;
-                h->kind = BLK_FREE;   /* coalesced lazily on next alloc */
+                h->kind = BLK_FREE;
             }
         }
         off += h->size;
@@ -981,7 +940,6 @@ static void run(VM* vm) {
             case 0x0C: R[ra] = R[rb] & R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x0D: R[ra] = R[rb] | R[rc]; fr->mask &= ~(1ULL << a); break;
             case 0x0E: R[ra] = R[rb] ^ R[rc]; fr->mask &= ~(1ULL << a); break;
-            /* 32-bit storage: shift count masked to 31 to stay defined */
             case 0x0F: R[ra] = R[rb] << (R[rc] & 31); fr->mask &= ~(1ULL << a); break;
             case 0x10: R[ra] = (Val)((int32_t)R[rb] >> (R[rc] & 31)); fr->mask &= ~(1ULL << a); break;
             case 0x11: { int16_t off = (int16_t)(b | (c << 8)); fr->ip = (uint32_t)((int32_t)fr->ip + off); break; }
@@ -1000,7 +958,7 @@ static void run(VM* vm) {
                 uint16_t idx = (uint16_t)(b | (c << 8));
                 if (idx >= fn->const_count) die("pushconst idx OOB");
                 uint8_t bit = (fn->const_mask[idx / 8] >> (idx % 8)) & 1;
-                Val v = (Val)fn->constants[idx];     /* low 32 bits */
+                Val v = (Val)fn->constants[idx];
                 if (bit) vm_bump_handle(vm, v);
                 write_reg(vm, fr, a, v, bit);
                 break;
